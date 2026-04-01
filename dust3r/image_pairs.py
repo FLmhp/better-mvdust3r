@@ -28,6 +28,25 @@ def make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True):
         for j in range(len(imgs)):
             if j != refid:
                 pairs.append((imgs[refid], imgs[j]))
+    elif scene_graph.startswith('anchorlocal'):
+        tokens = scene_graph.split('-')
+        radius = int(tokens[1]) if len(tokens) > 1 else 2
+        if len(tokens) > 2:
+            anchor_id = int(tokens[2])
+        else:
+            anchor_id = max(range(len(imgs)), key=lambda idx: float(imgs[idx].get('quality_score', 0.0)))
+
+        pairsid = set()
+        for j in range(len(imgs)):
+            if j != anchor_id:
+                pairsid.add((anchor_id, j) if anchor_id < j else (j, anchor_id))
+        for i in range(len(imgs)):
+            for offset in range(1, radius + 1):
+                j = i + offset
+                if j < len(imgs):
+                    pairsid.add((i, j))
+        for i, j in sorted(pairsid):
+            pairs.append((imgs[i], imgs[j]))
     if symmetrize:
         pairs += [(img2, img1) for img1, img2 in pairs]
 

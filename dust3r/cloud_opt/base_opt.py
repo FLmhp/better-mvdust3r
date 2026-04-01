@@ -349,9 +349,20 @@ class BasePCOptimizer (nn.Module):
         return viz
 
 
-def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
+def global_alignment_loop(
+    net,
+    lr=0.01,
+    niter=300,
+    schedule='cosine',
+    lr_min=1e-6,
+    min_iter=None,
+    check_every=1,
+    rel_tol=0.0,
+    patience=None,
+):
     params = [p for p in net.parameters() if p.requires_grad]
     if not params:
+        net.last_alignment_iterations = 0
         return net
 
     verbose = net.verbose
@@ -359,19 +370,43 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
         print('Global alignement - optimizing for:')
         print([name for name, value in net.named_parameters() if value.requires_grad])
 
+    min_iter = niter if min_iter is None else max(0, int(min_iter))
+    check_every = max(1, int(check_every))
+    patience = 0 if patience is None else max(0, int(patience))
     lr_base = lr
     optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9))
 
     loss = float('inf')
+    last_checked_loss = None
+    stale_checks = 0
+    iterations_run = 0
     if verbose:
         with tqdm.tqdm(total=niter) as bar:
             while bar.n < bar.total:
                 loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule)
                 bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
                 bar.update()
+                iterations_run += 1
+                if patience and iterations_run >= min_iter and iterations_run % check_every == 0:
+                    if last_checked_loss is not None:
+                        improvement = (last_checked_loss - loss) / max(abs(last_checked_loss), 1e-8)
+                        stale_checks = stale_checks + 1 if improvement < rel_tol else 0
+                    last_checked_loss = loss
+                    if stale_checks >= patience:
+                        print(f'>> Early-stopping global alignment at iter={iterations_run} with loss={loss:g}')
+                        break
     else:
         for n in range(niter):
             loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule)
+            iterations_run += 1
+            if patience and iterations_run >= min_iter and iterations_run % check_every == 0:
+                if last_checked_loss is not None:
+                    improvement = (last_checked_loss - loss) / max(abs(last_checked_loss), 1e-8)
+                    stale_checks = stale_checks + 1 if improvement < rel_tol else 0
+                last_checked_loss = loss
+                if stale_checks >= patience:
+                    break
+    net.last_alignment_iterations = iterations_run
     return loss
 
 

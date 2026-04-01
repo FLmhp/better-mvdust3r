@@ -35,6 +35,12 @@ import matplotlib.pyplot as pl
 from dust3r.inference import inference, inference_mv
 from dust3r.losses import calibrate_camera_pnpransac, estimate_focal_knowing_depth
 from dust3r.model import AsymmetricCroCo3DStereoMultiView
+from dust3r.runtime_utils import (
+    adapt_conf_drop_percentile,
+    confidence_keep_mask,
+    mean_quality_score,
+    min_keep_points_from_hw,
+)
 from dust3r.utils.device import to_numpy
 
 from dust3r.utils.image import load_images, rgb
@@ -43,7 +49,6 @@ from dust3r.viz import add_scene_cam, CAM_COLORS, cat_meshes, OPENGL, pts3d_to_t
 pl.ion()
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
-batch_size = 1
 
 
 def get_args_parser():
@@ -63,7 +68,35 @@ def get_args_parser():
     parser.add_argument("--tmp_dir", type=str, default=None, help="value for tempfile.tempdir")
     parser.add_argument("--silent", action='store_true', default=False,
                         help="silence logs")
+    parser.add_argument("--runtime_profile", type=str, default="lite_robust_v1",
+                        choices=["default", "lite_robust_v1"], help="runtime profile")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None,
+                        help="enable mixed precision inference")
+    parser.add_argument("--preprocess_profile", type=str, default=None,
+                        choices=["none", "lite_robust_v1"], help="image preprocessing profile")
+    parser.add_argument("--quality_adaptive", action=argparse.BooleanOptionalAction, default=True,
+                        help="adapt thresholds to the estimated image quality")
+    parser.add_argument("--focal_conf_percentile", type=float, default=None,
+                        help="bottom percentile dropped when estimating the first-view focal")
     return parser
+
+
+def resolve_runtime_options(args):
+    if args.runtime_profile == "lite_robust_v1":
+        amp = True if args.amp is None else args.amp
+        preprocess_profile = args.preprocess_profile or "lite_robust_v1"
+        focal_conf_percentile = 5.0 if args.focal_conf_percentile is None else args.focal_conf_percentile
+    else:
+        amp = False if args.amp is None else args.amp
+        preprocess_profile = args.preprocess_profile or "none"
+        focal_conf_percentile = 3.0 if args.focal_conf_percentile is None else args.focal_conf_percentile
+
+    return {
+        "amp": amp,
+        "preprocess_profile": preprocess_profile,
+        "quality_adaptive": bool(args.quality_adaptive),
+        "focal_conf_percentile": float(focal_conf_percentile),
+    }
 
 
 def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
@@ -110,49 +143,73 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
     return outfile
 
 
-def get_3D_model_from_scene(outdir, silent, output, min_conf_thr=3, as_pointcloud=False, transparent_cams=False, cam_size=0.05, only_model=False):
+def get_3D_model_from_scene(
+    outdir,
+    silent,
+    output,
+    min_conf_thr=3,
+    as_pointcloud=False,
+    transparent_cams=False,
+    cam_size=0.05,
+    only_model=False,
+    runtime_options=None,
+):
     """
     extract 3D_model (glb file) from a reconstructed scene
     """
 
     with torch.no_grad():
         
+        runtime_options = runtime_options or {}
         _, h, w = output['pred1']['rgb'].shape[0:3] # [1, H, W, 3]
         rgbimg = [output['pred1']['rgb'][0]] + [x['rgb'][0] for x in output['pred2s']]
         for i in range(len(rgbimg)):
             rgbimg[i] = (rgbimg[i] + 1) / 2
         pts3d = [output['pred1']['pts3d'][0]] + [x['pts3d_in_other_view'][0] for x in output['pred2s']]
         conf = torch.stack([output['pred1']['conf'][0]] + [x['conf'][0] for x in output['pred2s']], 0) # [N, H, W]
-        conf_sorted = conf.reshape(-1).sort()[0]
-        conf_thres = conf_sorted[int(conf_sorted.shape[0] * float(min_conf_thr) * 0.01)]
-        msk = conf >= conf_thres
-        
+        mean_quality = float(output.get('quality_score', 0.0))
+        effective_conf_percentile = adapt_conf_drop_percentile(
+            min_conf_thr, mean_quality, runtime_options.get("quality_adaptive", False)
+        )
+        min_keep = min_keep_points_from_hw(h, w)
+        msk = confidence_keep_mask(conf, effective_conf_percentile, min_keep=min_keep * conf.shape[0])
+
         # calculate focus:
 
-        conf_first = conf[0].reshape(-1) # [bs, H * W]
-        conf_sorted = conf_first.sort()[0] # [bs, h * w]
-        conf_thres = conf_sorted[int(conf_first.shape[0] * 0.03)]
-        valid_first = (conf_first >= conf_thres) # & valids[0].reshape(bs, -1)
-        valid_first = valid_first.reshape(h, w)
+        focal_conf_percentile = adapt_conf_drop_percentile(
+            runtime_options.get("focal_conf_percentile", 3.0),
+            mean_quality,
+            runtime_options.get("quality_adaptive", False),
+        )
+        valid_first = confidence_keep_mask(conf[0], focal_conf_percentile, min_keep=min_keep)
 
-        focals = estimate_focal_knowing_depth(pts3d[0][None].cuda(), valid_first[None].cuda()).cpu().item()
+        focus_device = pts3d[0].device
+        focals = estimate_focal_knowing_depth(
+            pts3d[0][None].to(focus_device),
+            valid_first[None].to(focus_device),
+        ).cpu().item()
 
         intrinsics = torch.eye(3,)
         intrinsics[0, 0] = focals
         intrinsics[1, 1] = focals
         intrinsics[0, 2] = w / 2
         intrinsics[1, 2] = h / 2
-        intrinsics = intrinsics.cuda()
+        intrinsics = intrinsics.to(focus_device)
 
         focals = torch.Tensor([focals]).reshape(1,).repeat(len(rgbimg))
 
         
         y_coords, x_coords = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-        pixel_coords = torch.stack([x_coords, y_coords], dim=-1).float().cuda() # [H, W, 2]
+        pixel_coords = torch.stack([x_coords, y_coords], dim=-1).float().to(focus_device) # [H, W, 2]
         
         c2ws = []
         for (pr_pt, valid) in zip(pts3d, msk):
-            c2ws_i = calibrate_camera_pnpransac(pr_pt.cuda().flatten(0,1)[None], pixel_coords.flatten(0,1)[None], valid.cuda().flatten(0,1)[None], intrinsics[None])
+            c2ws_i = calibrate_camera_pnpransac(
+                pr_pt.to(focus_device).flatten(0, 1)[None],
+                pixel_coords.flatten(0, 1)[None],
+                valid.to(focus_device).flatten(0, 1)[None],
+                intrinsics[None],
+            )
             c2ws.append(c2ws_i[0])
 
         cams2world = torch.stack(c2ws, dim=0).cpu() # [N, 4, 4]
@@ -170,12 +227,19 @@ def get_3D_model_from_scene(outdir, silent, output, min_conf_thr=3, as_pointclou
 
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, min_conf_thr,
-                            as_pointcloud, transparent_cams, cam_size, n_frame):
+                            as_pointcloud, transparent_cams, cam_size, n_frame, runtime_options=None):
     """
     from a list of images, run dust3r inference, global aligner.
     then run get_3D_model_from_scene
     """
-    imgs = load_images(filelist, size=image_size, verbose=not silent, n_frame = n_frame)
+    runtime_options = runtime_options or {}
+    imgs = load_images(
+        filelist,
+        size=image_size,
+        verbose=not silent,
+        n_frame=n_frame,
+        preprocess_profile=runtime_options.get("preprocess_profile", "none"),
+    )
     if len(imgs) == 1:
         imgs = [imgs[0], copy.deepcopy(imgs[0])]
         imgs[1]['idx'] = 1
@@ -195,15 +259,24 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
         change_id = (len(imgs) * 3) // 4 + 1
         imgs[3], imgs[change_id] = deepcopy(imgs[change_id]), deepcopy(imgs[3])
     
-    output = inference_mv(imgs, model, device, verbose=not silent)
-    input('press enter to continue')
+    output = inference_mv(imgs, model, device, verbose=not silent, use_amp=runtime_options.get("amp", False))
 
     # print(output['pred1']['rgb'].shape, imgs[0]['img'].shape, 'aha')
     output['pred1']['rgb'] = imgs[0]['img'].permute(0,2,3,1)
     for x, img in zip(output['pred2s'], imgs[1:]):
         x['rgb'] = img['img'].permute(0,2,3,1)
-    
-    outfile, rgbimg, confs = get_3D_model_from_scene(outdir, silent, output, min_conf_thr, as_pointcloud, transparent_cams, cam_size)
+    output['quality_score'] = np.float32(mean_quality_score(imgs) or 0.0)
+
+    outfile, rgbimg, confs = get_3D_model_from_scene(
+        outdir,
+        silent,
+        output,
+        min_conf_thr,
+        as_pointcloud,
+        transparent_cams,
+        cam_size,
+        runtime_options=runtime_options,
+    )
 
     # also return rgb, depth and confidence imgs
     # depth is normalized with the max value for all images
@@ -246,9 +319,23 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
                               maximum=num_files-1, step=1, visible=False)
     return winsize, refid
 
-def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False):
-    recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, model, device, silent, image_size)
-    model_from_scene_fun = functools.partial(get_3D_model_from_scene, tmpdirname, silent, only_model = True)
+def main_demo(tmpdirname, model, device, image_size, server_name, server_port, runtime_options, silent=False):
+    recon_fun = functools.partial(
+        get_reconstructed_scene,
+        tmpdirname,
+        model,
+        device,
+        silent,
+        image_size,
+        runtime_options=runtime_options,
+    )
+    model_from_scene_fun = functools.partial(
+        get_3D_model_from_scene,
+        tmpdirname,
+        silent,
+        only_model=True,
+        runtime_options=runtime_options,
+    )
     with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="MV-DUSt3R+ Demo", theme="default") as demo:
         # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
         scene = gradio.State(None)
@@ -290,11 +377,12 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             transparent_cams.change(model_from_scene_fun,
                                     inputs=[scene, min_conf_thr, as_pointcloud, transparent_cams, cam_size],
                                     outputs=outmodel)
-    demo.launch(share=True, server_name='127.0.0.1', server_port=args.server_port)
+    demo.launch(share=True, server_name=server_name, server_port=server_port)
 
 if __name__ == '__main__':
     parser = get_args_parser()
     args = parser.parse_args()
+    runtime_options = resolve_runtime_options(args)
 
     if args.tmp_dir is not None:
         tmp_path = args.tmp_dir
@@ -331,9 +419,20 @@ if __name__ == '__main__':
     else:
         raise ValueError(f"{args.model_name} is not supported")
 
+    model.eval()
+
 
     # dust3r will write the 3D model inside tmpdirname
     with tempfile.TemporaryDirectory(suffix='dust3r_gradio_demo') as tmpdirname:
         if not args.silent:
             print('Outputing stuff in', tmpdirname)
-        main_demo(tmpdirname, model, args.device, args.image_size, server_name, args.server_port, silent=args.silent)
+        main_demo(
+            tmpdirname,
+            model,
+            args.device,
+            args.image_size,
+            server_name,
+            args.server_port,
+            runtime_options,
+            silent=args.silent,
+        )

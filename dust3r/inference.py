@@ -10,6 +10,7 @@ import torch
 from dust3r.utils.device import to_cpu, collate_with_cat
 from dust3r.utils.misc import invalid_to_nans
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
+from dust3r.runtime_utils import build_batch_size_candidates, is_oom_error
 
 
 def _interleave_imgs(img1, img2):
@@ -77,14 +78,14 @@ def loss_of_one_batch(batch, model, criterion, device, symmetrize_batch=False, u
     return result[ret] if ret else result
 
 @torch.no_grad()
-def inference_mv(batch, model, device, verbose=True):
+def inference_mv(batch, model, device, verbose=True, use_amp=False):
 
     if verbose:
         print(f'>> Inference with model on {len(batch)} images')
 
     result = []
 
-    res = loss_of_one_batch_mv(batch, model, None, device, log = True)
+    res = loss_of_one_batch_mv(batch, model, None, device, use_amp=use_amp, log=True)
     result.append(to_cpu(res))
 
     result = collate_with_cat(result, lists=False)
@@ -92,7 +93,7 @@ def inference_mv(batch, model, device, verbose=True):
     return result
 
 @torch.no_grad()
-def inference(pairs, model, device, batch_size=8, verbose=True):
+def inference(pairs, model, device, batch_size=8, verbose=True, use_amp=False, oom_retry=False):
     if verbose:
         print(f'>> Inference with model on {len(pairs)} image pairs')
     result = []
@@ -101,10 +102,37 @@ def inference(pairs, model, device, batch_size=8, verbose=True):
     multiple_shapes = not (check_if_same_size(pairs))
     if multiple_shapes:  # force bs=1
         batch_size = 1
+    batch_size_candidates = build_batch_size_candidates(batch_size, oom_retry and not multiple_shapes)
 
-    for i in tqdm.trange(0, len(pairs), batch_size, disable=not verbose):
-        res = loss_of_one_batch(collate_with_cat(pairs[i:i+batch_size]), model, None, device)
-        result.append(to_cpu(res))
+    current_batch_idx = 0
+    current_batch_size = batch_size_candidates[current_batch_idx]
+    pair_index = 0
+    progress_bar = tqdm.tqdm(total=len(pairs), disable=not verbose)
+    try:
+        while pair_index < len(pairs):
+            step_batch_size = 1 if multiple_shapes else current_batch_size
+            try:
+                res = loss_of_one_batch(
+                    collate_with_cat(pairs[pair_index:pair_index + step_batch_size]),
+                    model,
+                    None,
+                    device,
+                    use_amp=use_amp,
+                )
+                result.append(to_cpu(res))
+                pair_index += step_batch_size
+                progress_bar.update(step_batch_size)
+            except RuntimeError as exc:
+                if multiple_shapes or current_batch_idx >= len(batch_size_candidates) - 1 or not is_oom_error(exc):
+                    raise
+                current_batch_idx += 1
+                current_batch_size = batch_size_candidates[current_batch_idx]
+                if verbose:
+                    print(f'>> CUDA OOM, retrying pair inference with batch_size={current_batch_size}')
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    finally:
+        progress_bar.close()
 
     result = collate_with_cat(result, lists=multiple_shapes)
 

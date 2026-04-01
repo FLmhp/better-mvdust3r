@@ -13,6 +13,8 @@ import torchvision.transforms as tvf
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2  # noqa
 
+from dust3r.runtime_utils import compute_image_quality_score, preprocess_pil_image
+
 try:
     from pillow_heif import register_heif_opener  # noqa
     register_heif_opener()
@@ -65,7 +67,7 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
-def load_images(folder_or_list, size, square_ok=False, verbose=True, n_frame = 10):
+def load_images(folder_or_list, size, square_ok=False, verbose=True, n_frame=10, preprocess_profile="none"):
     """ open and convert all images in a list or folder to proper input format for DUSt3R
     """
     if isinstance(folder_or_list, str):
@@ -106,6 +108,10 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, n_frame = 1
             img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
             imgs_raw.append(img)
     for img in imgs_raw:
+        raw_quality_score = compute_image_quality_score(img)
+        img, processed_quality_score = preprocess_pil_image(
+            img, profile=preprocess_profile, quality_score=raw_quality_score
+        )
         # if not path.lower().endswith(supported_images_extensions):
         #     continue
         W1, H1 = img.size
@@ -130,7 +136,8 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, n_frame = 1
         # if verbose:
         #     print(f' - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}')
         imgs.append(dict(img=ImgNorm(img)[None], true_shape=np.int32(
-            [img.size[::-1]]), idx=len(imgs), instance=str(len(imgs))))
+            [img.size[::-1]]), idx=len(imgs), instance=str(len(imgs)),
+            quality_score=np.float32(processed_quality_score), raw_quality_score=np.float32(raw_quality_score)))
         # print('adding image', imgs[-1]['img'].shape, imgs[-1]['img'].max(), imgs[-1]['img'].min(), imgs[-1]['true_shape'], imgs[-1]['idx'], imgs[-1]['instance'])
         # adding image torch.Size([1, 3, 384, 512]) tensor(1.) tensor(-0.9608) [[384 512]] 3 3
     assert imgs, 'no images foud at '+root

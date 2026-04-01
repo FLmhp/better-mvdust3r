@@ -9,6 +9,7 @@ from pytorch3d.ops import knn_points
 from dust3r.utils.geometry import xy_grid
 
 from dust3r.inference import get_pred_pts3d, find_opt_scaling
+from dust3r.runtime_utils import confidence_keep_mask, min_keep_points_from_hw
 from dust3r.utils.geometry import inv, geotrf, normalize_pointcloud, normalize_pointclouds
 from dust3r.utils.geometry import get_joint_pointcloud_depth, get_joint_pointcloud_center_scale, get_joint_pointcloud_depths, get_joint_pointcloud_center_scales
 
@@ -223,6 +224,50 @@ def Sum(*losses_and_masks):
             else:
                 loss = loss + loss2
         return loss
+
+
+def _view_sample_weights(view, key, device):
+    value = view.get(key)
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        weights = value.to(device=device, dtype=torch.float32)
+    else:
+        weights = torch.as_tensor(value, device=device, dtype=torch.float32)
+    if weights.ndim == 0:
+        weights = weights.unsqueeze(0)
+    return weights.reshape(-1)
+
+
+def _apply_sample_weights(values, sample_weights):
+    if sample_weights is None or not torch.is_tensor(values):
+        return values
+    return values * sample_weights.to(device=values.device, dtype=values.dtype)
+
+
+def _masked_sample_weights(mask, sample_weights):
+    if sample_weights is None:
+        return None
+    view_shape = (sample_weights.shape[0],) + (1,) * (mask.ndim - 1)
+    return sample_weights.reshape(view_shape).expand_as(mask)[mask]
+
+
+def _masked_weighted_criterion(criterion, pred_pts, gt_pts, mask, sample_weights=None):
+    reduction = criterion.reduction
+    if reduction == 'mean_bs':
+        losses = criterion(pred_pts, gt_pts, mask, reduction='mean_bs')
+        return _apply_sample_weights(losses, sample_weights)
+
+    losses = criterion(pred_pts[mask], gt_pts[mask], reduction='none')
+    losses = _apply_sample_weights(losses, _masked_sample_weights(mask, sample_weights))
+
+    if reduction == 'none':
+        return losses
+    if reduction == 'sum':
+        return losses.sum()
+    if reduction == 'mean':
+        return losses.mean() if losses.numel() > 0 else losses.new_zeros(())
+    raise ValueError(f'bad {reduction=} mode')
 
 def extend_gts(gts, n_ref, bs):
         gts = recursive_repeat_interleave_collate(gts, 0, n_ref)
@@ -659,10 +704,12 @@ class Regr3D (Criterion, MultiLoss):
     def compute_loss(self, gt1, gt2, pred1, pred2, **kw):
         gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring = \
             self.get_all_pts3d(gt1, gt2, pred1, pred2, **kw)
+        weight1 = _view_sample_weights(gt1, 'geometry_loss_weight', pred_pts1.device)
+        weight2 = _view_sample_weights(gt2, 'geometry_loss_weight', pred_pts2.device)
         # loss on img1 side
-        l1 = self.criterion(pred_pts1[mask1], gt_pts1[mask1])
+        l1 = _masked_weighted_criterion(self.criterion, pred_pts1, gt_pts1, mask1, sample_weights=weight1)
         # loss on gt2 side
-        l2 = self.criterion(pred_pts2[mask2], gt_pts2[mask2])
+        l2 = _masked_weighted_criterion(self.criterion, pred_pts2, gt_pts2, mask2, sample_weights=weight2)
         self_name = type(self).__name__
         details = {self_name+'_pts3d_1': float(l1.mean()), self_name+'_pts3d_2': float(l2.mean())}
         return Sum((l1, mask1), (l2, mask2)), (details | monitoring)
@@ -675,6 +722,8 @@ class Regr3D (Criterion, MultiLoss):
         
         gt_pts1, gt_pts2s, pred_pts1, pred_pts2s, mask1, mask2s, monitoring = \
             self.get_all_pts3ds(gt1, gt2s, pred1, pred2s, **kw)
+        weight1 = _view_sample_weights(gt1, 'geometry_loss_weight', pred_pts1.device)
+        weight2s = [_view_sample_weights(gt2, 'geometry_loss_weight', pred_pts2.device) for gt2, pred_pts2 in zip(gt2s, pred_pts2s)]
 
         nv = len(gt_pts2s) + 1
         bs = gt_pts1.shape[0]
@@ -692,6 +741,8 @@ class Regr3D (Criterion, MultiLoss):
             gt_pcds_original_diff = gt_pcds_original_0_9 - gt_pcds_original_0_1
             l1 = self.criterion(pred_pts1, gt_pts1, mask1, reduction='mean_bs')
             l2s = [self.criterion(pred_pts2, gt_pts2, mask2, reduction='mean_bs') for (gt_pts2, pred_pts2, mask2) in zip(gt_pts2s, pred_pts2s, mask2s)]
+            l1 = _apply_sample_weights(l1, weight1)
+            l2s = [_apply_sample_weights(l2, weight2) for l2, weight2 in zip(l2s, weight2s)]
             
             self_name = type(self).__name__
             details = {self_name+'_pts3d_1': float(l1.mean()), self_name+'_pts3d_2': np.mean([float(l2.mean()) for l2 in l2s]).item()}
@@ -742,8 +793,11 @@ class Regr3D (Criterion, MultiLoss):
                 details[self_name+'_cd_first'] = cd_mref[:, 0].mean().item()
                 details[self_name+'_cd_best'] = torch.min(cd_mref, dim = 1)[0].mean().item()
             
-            l1 = self.criterion(pred_pts1[mask1], gt_pts1[mask1])
-            l2s = [self.criterion(pred_pts2[mask2], gt_pts2[mask2]) for (gt_pts2, pred_pts2, mask2) in zip(gt_pts2s, pred_pts2s, mask2s)]
+            l1 = _masked_weighted_criterion(self.criterion, pred_pts1, gt_pts1, mask1, sample_weights=weight1)
+            l2s = [
+                _masked_weighted_criterion(self.criterion, pred_pts2, gt_pts2, mask2, sample_weights=weight2)
+                for (gt_pts2, pred_pts2, mask2, weight2) in zip(gt_pts2s, pred_pts2s, mask2s, weight2s)
+            ]
             
         else:
             if self.rot_invariant:
@@ -758,13 +812,21 @@ class Regr3D (Criterion, MultiLoss):
                 
                 mask1 = mask[:, 0].reshape(bs, h, w)
                 l1 = ls[:, 0][mask[:, 0]]
+                l1 = _apply_sample_weights(l1, _masked_sample_weights(mask1, weight1))
 
                 mask2s = [mask[:, i].reshape(bs, h, w) for i in range(1, nv)]
                 l2s = [ls[:, i][mask[:, i]] for i in range(1, nv)]
+                l2s = [
+                    _apply_sample_weights(l2, _masked_sample_weights(mask2, weight2))
+                    for (l2, mask2, weight2) in zip(l2s, mask2s, weight2s)
+                ]
 
             else:
-                l1 = self.criterion(pred_pts1[mask1], gt_pts1[mask1])
-                l2s = [self.criterion(pred_pts2[mask2], gt_pts2[mask2]) for (gt_pts2, pred_pts2, mask2) in zip(gt_pts2s, pred_pts2s, mask2s)]
+                l1 = _masked_weighted_criterion(self.criterion, pred_pts1, gt_pts1, mask1, sample_weights=weight1)
+                l2s = [
+                    _masked_weighted_criterion(self.criterion, pred_pts2, gt_pts2, mask2, sample_weights=weight2)
+                    for (gt_pts2, pred_pts2, mask2, weight2) in zip(gt_pts2s, pred_pts2s, mask2s, weight2s)
+                ]
                 
             details = {}
         
@@ -1136,9 +1198,11 @@ class GSRenderLoss (Criterion, MultiLoss):
                 pixel_coords = pixel_coords.to(gt_pts1.device).repeat(gt_pts1.shape[0], 1, 1, 1).float() # [B, h, w, 3]
                 
                 conf = preds[0]['conf'].reshape(bs, -1) # [bs, H * W]
-                conf_sorted = conf.sort()[0] # [bs, h * w]
-                conf_thres = conf_sorted[:, int(conf.shape[1] * 0.03)]
-                valid1 = (conf >= conf_thres[:, None]) # & valids[0].reshape(bs, -1)
+                min_keep = min_keep_points_from_hw(h, w)
+                valid1 = torch.stack(
+                    [confidence_keep_mask(conf_i, 3.0, min_keep=min_keep) for conf_i in conf],
+                    dim=0,
+                )
                 valid1 = valid1.reshape(bs, h, w)
                 intrinsics = []
                 pts3d = preds[0]['pts3d'] # [bs, H, W, 3]
@@ -1239,7 +1303,7 @@ class GSRenderLoss (Criterion, MultiLoss):
 
     # def compute_loss_mv(self, gt1, gt2s, pred1, pred2s, log, scale_range = [0.0001, 0.02], **kw):
     # def compute_loss_mv(self, gt1, gt2s, pred1, pred2s, log, scale_range = [0.00001, 0.001], **kw):
-    def local_lap_loss(self, pts3d, gts3d, c2ws_all, mask_all): # [bs, h, w, 3], [bs, h, w, 3], [bs, 4, 4], [bs, h, w]
+    def local_lap_loss(self, pts3d, gts3d, c2ws_all, mask_all, return_per_view = False): # [bs, h, w, 3], [bs, h, w, 3], [bs, 4, 4], [bs, h, w]
         
         cam_centers = c2ws_all[:, :3, 3] # [bs, 3]
         pts_dis = (pts3d - cam_centers[:,None,None]).norm(dim = -1) # [bs, h, w]
@@ -1248,10 +1312,14 @@ class GSRenderLoss (Criterion, MultiLoss):
         gts_dis_lap = calc_metrics.laplace(gts_dis.unsqueeze(-1)) # [bs, h, w, 1]
         lap_loss = (pts_dis_lap - gts_dis_lap).abs().squeeze(-1)
         lap_loss[~mask_all] = 0
-        lap_loss = lap_loss.mean()
-        return lap_loss
+        lap_loss = lap_loss.reshape(lap_loss.shape[0], -1)
+        mask_flat = mask_all.reshape(mask_all.shape[0], -1)
+        lap_loss = lap_loss.sum(-1) / (mask_flat.sum(-1).clamp(min=1).to(lap_loss.dtype))
+        if return_per_view:
+            return lap_loss
+        return lap_loss.mean()
     
-    def local_loss(self, pts3d_, gts3d_, c2ws_all_, mask_all_, conf_all_, real_bs): # [bs, h, w, 3], [bs, h, w, 3], [bs, 4, 4], [bs, h, w] (bs = real_bs * n_inference)
+    def local_loss(self, pts3d_, gts3d_, c2ws_all_, mask_all_, conf_all_, real_bs, return_per_sample = False): # [bs, h, w, 3], [bs, h, w, 3], [bs, 4, 4], [bs, h, w] (bs = real_bs * n_inference)
         
         loss_type = "dis"
         loss_type = "only_T"
@@ -1308,8 +1376,13 @@ class GSRenderLoss (Criterion, MultiLoss):
         gts3d_normalized = gts3d_center / (gts3d_norm_mean[:, None, None] + 1e-8) # [bs, h*w, 3]
         
         if "only_T" in loss_type:
-            local_loss = (pts3d_normalized - gts3d_normalized).norm(dim = -1).mean()
-        # return local_loss
+            per_view_loss = (pts3d_normalized - gts3d_normalized).norm(dim = -1)
+            per_view_loss = per_view_loss * mask_all
+            per_view_loss = per_view_loss.sum(-1) / (mask_all.sum(-1).clamp(min=1).to(per_view_loss.dtype))
+            per_sample_loss = per_view_loss.reshape(real_bs, -1).mean(-1)
+            if return_per_sample:
+                return per_sample_loss
+            return per_sample_loss.mean()
 
         # conf_sorted = conf_all.sort()[0] # [n_inference, h * w]
         # conf_thres = conf_sorted[:, int(conf_all.shape[1] * 0.03)]
@@ -1345,6 +1418,7 @@ class GSRenderLoss (Criterion, MultiLoss):
         bs, h, w = gt_pts1.shape[:3]
         nv = len(gt2s) + 1
         n_inference = len(pred_pts2s) + 1
+        geom_batch_weights = _view_sample_weights(gt1, 'geometry_loss_weight', gt_pts1.device)
         mask_all = torch.stack([mask1] + mask2s, 1) # (bs, nv, h, w)
         conf_all = torch.stack([pred1['conf']] + [pred2['conf'] for pred2 in pred2s], 1) # (bs, n_inference, h, w)
         self.gs_renderer.set_view_info(height = h, width = w)
@@ -1368,9 +1442,28 @@ class GSRenderLoss (Criterion, MultiLoss):
         c2ws_gs_all = torch.stack([c2w for c2w in c2ws], 1) # [bs, nv, 4, 4]
 
         if self.local_loss_coeff:
-            loss_local = self.local_loss(pts3d_all.flatten(0, 1), gts3d_all.flatten(0, 1), c2ws_gs_all[:,:n_inference].flatten(0, 1), mask_all[:,:n_inference].flatten(0, 1), conf_all.flatten(0, 1), bs)
+            loss_local = self.local_loss(
+                pts3d_all.flatten(0, 1),
+                gts3d_all.flatten(0, 1),
+                c2ws_gs_all[:,:n_inference].flatten(0, 1),
+                mask_all[:,:n_inference].flatten(0, 1),
+                conf_all.flatten(0, 1),
+                bs,
+                return_per_sample=True,
+            )
+            loss_local = _apply_sample_weights(loss_local, geom_batch_weights)
+            loss_local = loss_local.mean()
         if self.lap_loss_coeff:
-            loss_lap = self.local_lap_loss(pts3d_all.flatten(0, 1), gts3d_all.flatten(0, 1), c2ws_gs_all[:,:n_inference].flatten(0, 1), mask_all[:,:n_inference].flatten(0, 1))
+            loss_lap = self.local_lap_loss(
+                pts3d_all.flatten(0, 1),
+                gts3d_all.flatten(0, 1),
+                c2ws_gs_all[:,:n_inference].flatten(0, 1),
+                mask_all[:,:n_inference].flatten(0, 1),
+                return_per_view=True,
+            )
+            loss_lap = loss_lap.reshape(bs, n_inference).mean(-1)
+            loss_lap = _apply_sample_weights(loss_lap, geom_batch_weights)
+            loss_lap = loss_lap.mean()
         for dp_id in range(bs):
             # gt1, gt2s, pred1, pred2s = torch.load('/home/zgtang/gt_pred.pt')
             # gt_pts1, gt_pts2s, pr_pts1, pr_pts2s, c2ws = torch.load('/home/zgtang/others.pt')
@@ -1417,9 +1510,12 @@ class GSRenderLoss (Criterion, MultiLoss):
                 if self.cam_relocation:
                     valid_mask = mask_all[dp_id][:n_inference].reshape(n_inference, -1) # [n_inference, h * w]
                     conf = conf_all[dp_id].reshape(n_inference, -1) # [n_inference, h * w]
-                    conf_sorted = conf.sort()[0] # [n_inference, h * w]
-                    conf_thres = conf_sorted[:, int(conf.shape[1] * 0.03)]
-                    valid_mask = valid_mask & (conf >= conf_thres[:, None])
+                    min_keep = min_keep_points_from_hw(h, w)
+                    conf_mask = torch.stack(
+                        [confidence_keep_mask(conf_i, 3.0, min_keep=min_keep) for conf_i in conf],
+                        dim=0,
+                    )
+                    valid_mask = valid_mask & conf_mask
                     R, sigma, t = umeyama_alignment(pts3d.reshape(n_inference, -1, 3), gts3d.reshape(n_inference, -1, 3), valid_mask)
                     Rt = torch.eye(4).to(R.device).repeat(n_inference, 1, 1)
                     Rt[:, :3, :3] = R
@@ -1483,6 +1579,7 @@ class GSRenderLoss (Criterion, MultiLoss):
             details[self_name+'_gs_loss_all'] = float(loss)
             details[self_name+'_local_loss'] = float(loss_local)
             details[self_name+'_lap_loss'] = float(loss_lap)
+            details[self_name+'_geom_weight'] = float(geom_batch_weights.mean()) if geom_batch_weights is not None else 1.0
             details[self_name+'_RRA'] = extra_info['RRA'].mean().item()
             details[self_name+'_RTA'] = extra_info['RTA'].mean().item()
             details[self_name+'_mAA'] = extra_info['mAA'].mean().item()

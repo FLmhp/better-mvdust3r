@@ -5,6 +5,7 @@ import itertools
 from collections import deque
 import imageio
 from copy import deepcopy
+from PIL import Image
 
 import cv2
 import numpy as np
@@ -12,6 +13,11 @@ import random
 import h5py
 
 from dust3r.datasets.base.base_stereo_view_dataset import BaseStereoViewDataset
+from dust3r.datasets.utils.corruptions import (
+    apply_geometry_corruption,
+    apply_rgb_corruption,
+    build_corruption_state,
+)
 from dust3r.utils.image import imread_cv2
 
 if 'META_INTERNAL' in os.environ.keys() and os.environ['META_INTERNAL'] == "False":
@@ -20,7 +26,7 @@ else:
     from meta_internal.io import *
     
 class MVDataset(BaseStereoViewDataset):
-    def __init__(self, mask_bg=True, from_tar = False, random_order = False, random_render_order = False, debug = False, *args, ROOT, n_test=1000, num_render_views = 0, n_vis_test = 8, n_vis_train = 8, split_thres = 0.9, render_start = None, tb_name = None, ref_all = False, n_ref = 1, random_nv_nr = None, dps_name = 'dps.h5', n_all = None, single_id = None, reverse = False, **kwargs):
+    def __init__(self, mask_bg=True, from_tar = False, random_order = False, random_render_order = False, debug = False, *args, ROOT, n_test=1000, num_render_views = 0, n_vis_test = 8, n_vis_train = 8, split_thres = 0.9, render_start = None, tb_name = None, ref_all = False, n_ref = 1, random_nv_nr = None, dps_name = 'dps.h5', n_all = None, single_id = None, reverse = False, corruption_profile = "none", corruption_severity = "mild", corruption_prob = 0.0, geom_noise_profile = "none", geom_noise_prob = 0.0, geom_loss_weight = 0.3, **kwargs):
         self.ROOT = ROOT
         self.num_render_views = num_render_views
         self.from_tar = from_tar
@@ -45,6 +51,12 @@ class MVDataset(BaseStereoViewDataset):
         self.random_nv_nr = random_nv_nr
         self.dps_name = dps_name
         self.single_id = single_id
+        self.corruption_profile = corruption_profile
+        self.corruption_severity = corruption_severity
+        self.corruption_prob = float(corruption_prob)
+        self.geom_noise_profile = geom_noise_profile
+        self.geom_noise_prob = float(geom_noise_prob)
+        self.geom_loss_weight = float(geom_loss_weight)
 
         # load all scenes
         self.data_name = osp.basename(self.ROOT)
@@ -159,6 +171,15 @@ class MVDataset(BaseStereoViewDataset):
 
         rgb_list, depth_list, pose_list, intrinsic_list = change_to_sr([rgb_list, depth_list, pose_list, intrinsic_list])
         views = []
+        corruption_state = build_corruption_state(
+            rng,
+            corruption_profile=self.corruption_profile,
+            corruption_severity=self.corruption_severity,
+            corruption_prob=self.corruption_prob,
+            geom_noise_profile=self.geom_noise_profile,
+            geom_noise_prob=self.geom_noise_prob,
+            geom_loss_weight=self.geom_loss_weight,
+        )
         for i in inference_set + render_set:
             
             if 'nv' in data_dict.keys():
@@ -185,6 +206,31 @@ class MVDataset(BaseStereoViewDataset):
 
             rgb, depth, intrinsic = self._crop_resize_if_necessary(
                 rgb, depth, intrinsic, resolution, rng=rng, info="[Empty]")
+
+            rgb_corruption_name = "none"
+            geom_noise_name = "none"
+            camera_pose = camera_pose.astype(np.float32)
+            intrinsic = intrinsic.astype(np.float32)
+            depth = depth.astype(np.float32)
+
+            if corruption_state["rgb_corrupted"]:
+                rgb, rgb_corruption_name = apply_rgb_corruption(
+                    rgb,
+                    rng,
+                    profile=corruption_state["corruption_profile"],
+                    severity=corruption_state["severity"],
+                )
+            if corruption_state["geom_corrupted"]:
+                depth, intrinsic, camera_pose, geom_noise_name = apply_geometry_corruption(
+                    depth,
+                    intrinsic,
+                    camera_pose,
+                    rng,
+                    profile=corruption_state["geom_noise_profile"],
+                    severity=corruption_state["severity"],
+                )
+            if not isinstance(rgb, Image.Image):
+                rgb = Image.fromarray(np.asarray(rgb).astype(np.uint8))
             if self.save_results:
                 if i < len(rgb_list):
                     if 'gibson' in rgb_list[i]:
@@ -216,6 +262,15 @@ class MVDataset(BaseStereoViewDataset):
                 num_render_views = random_nv_nr[1],
                 n_ref = self.n_ref,
                 C_avg = C_avg,
+                corruption_mode=corruption_state["mode"],
+                corruption_severity=corruption_state["severity"],
+                corruption_profile=corruption_state["corruption_profile"],
+                geom_noise_profile=corruption_state["geom_noise_profile"],
+                rgb_corrupted=np.bool_(corruption_state["rgb_corrupted"]),
+                geom_corrupted=np.bool_(corruption_state["geom_corrupted"]),
+                rgb_corruption_name=rgb_corruption_name,
+                geom_noise_name=geom_noise_name,
+                geometry_loss_weight=np.float32(corruption_state["geometry_loss_weight"]),
             ))
         
         if ref_view_id != 0:
