@@ -40,7 +40,7 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf \
 
 # 复制源码
 WORKDIR /workspace/mvdust3r
-COPY . /workspace/mvdust3r
+COPY requirements.txt /workspace/mvdust3r
 
 # 创建 Python 3.12 虚拟环境
 RUN uv venv ${VIRTUAL_ENV} --python 3.12
@@ -56,6 +56,8 @@ RUN uv pip install \
     --python ${VIRTUAL_ENV}/bin/python \
     --no-build-isolation \
     "git+https://github.com/facebookresearch/pytorch3d.git@${PYTORCH3D_TAG}"
+
+COPY . /workspace/mvdust3r
 
 # compile RoPE CUDA kernels for faster runtime
 RUN cd croco/models/curope \
