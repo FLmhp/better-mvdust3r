@@ -1,0 +1,11 @@
+apt update && apt upgrade
+apt-get install -y --no-install-recommends build-essential ca-certificates curl ffmpeg git libgl1 libglib2.0-0 ninja-build pkg-config
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+git clone https://gh-proxy.org/https://github.com/FLmhp/better-mvdust3r.git
+cd better-mvdust3r/
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple -r requirements.txt
+uv pip install --no-build-isolation "git+https://hk.gh-proxy.org/https://github.com/facebookresearch/pytorch3d.git@V0.7.8"
+python demo.py --weights checkpoints/best.pth --server_name 0.0.0.0 --server_port 7860
