@@ -99,6 +99,41 @@ def resolve_runtime_options(args):
     }
 
 
+def infer_model_name_from_weights(weights_path):
+    if weights_path is None:
+        return None
+
+    if "MVDp" in weights_path:
+        return "MVDp"
+    if "MVD" in weights_path:
+        return "MVD"
+
+    resolved_weights_path = get_local_path(weights_path)
+    if not os.path.isfile(resolved_weights_path):
+        return None
+
+    try:
+        checkpoint = torch.load(resolved_weights_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+
+    if not isinstance(checkpoint, dict):
+        return None
+
+    model_config = checkpoint.get("model_name")
+    if not isinstance(model_config, str):
+        train_args = checkpoint.get("args")
+        model_config = getattr(train_args, "model", None)
+
+    if isinstance(model_config, str):
+        if "m_ref_flag=True" in model_config:
+            return "MVDp"
+        if "AsymmetricCroCo3DStereoMultiView" in model_config:
+            return "MVD"
+
+    return None
+
+
 def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
                                  cam_color=None, as_pointcloud=False,
                                  transparent_cams=False, silent=False):
@@ -396,11 +431,8 @@ if __name__ == '__main__':
 
     weights_path = args.weights
     if args.model_name is None:
-        if "MVDp" in args.weights:
-            args.model_name = "MVDp"
-        elif "MVD" in args.weights:
-            args.model_name = "MVD"
-        else:
+        args.model_name = infer_model_name_from_weights(weights_path)
+        if args.model_name is None:
             raise ValueError("model name not found in weights path")
 
     if args.model_name == "MVD":
