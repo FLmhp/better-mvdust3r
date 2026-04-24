@@ -1,8 +1,27 @@
 # Better MV-DUSt3R
 
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](./requirements.txt)
+[![CUDA 12.4](https://img.shields.io/badge/CUDA-12.4-76B900?style=flat-square&logo=nvidia&logoColor=white)](./Dockerfile)
+[![PyTorch 2.4.1](https://img.shields.io/badge/PyTorch-2.4.1-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](./requirements.txt)
+[![Checkpoint best.pth](https://img.shields.io/badge/Checkpoint-best.pth-6f42c1?style=flat-square)](./checkpoints/README.md)
+[![License](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey?style=flat-square)](./LICENSE)
+
+<!-- README-I18N:START -->
+
+[English](./README.en.md) | **汉语**
+
+<!-- README-I18N:END -->
+
+> 面向低显存推理、质量自适应重建和 corruption-aware 训练的 MV-DUSt3R 工程优化分支。
+
 `better-mvdust3r` 是基于 [MV-DUSt3R / MV-DUSt3R+](https://arxiv.org/abs/2412.06974) 的工程优化分支，目标是在**不改动模型主体结构与原有训练/推理入口兼容性**的前提下，改善低显存推理、低质量输入稳健性，以及带噪监督下的训练稳定性。
 
-这个仓库保留了原始的训练、评测和 Demo 工作流，同时补上了更适合当前分支的运行时配置、Docker 路径和稳健训练脚本。
+这个仓库保留了原始的训练、评测和 Demo 工作流，同时补上了更适合当前分支的运行时配置、Docker 路径、多语言说明，以及新的稳健训练脚本。
+
+> [!NOTE]
+> 当前仓库已经内置 `checkpoints/best.pth`，它是本分支新的训练方式产出的推荐默认权重。
+
+**快速链接：** [论文](https://arxiv.org/abs/2412.06974) · [上游 MV-DUSt3R](https://github.com/facebookresearch/mvdust3r) · [快速启动命令](./command.txt) · [Docker 运行脚本](./run.ps1)
 
 ## 这个分支做了什么
 
@@ -14,7 +33,7 @@
 | Global Optimization | 最小迭代数 + 检查周期 + 相对改善阈值 + `patience` 早停 |
 | Demo / CLI 一致性 | `demo.py` 与 `inference_global_optimization.py` 共用运行时配置思想 |
 | 稳健训练 | corruption-aware 数据采样、RGB/几何噪声注入、`geometry_loss_weight` 降权 |
-| 复现与部署 | Dockerfile、`run.ps1`、保留原始训练/测试脚本并新增 robust fine-tune 脚本 |
+| 复现与部署 | Dockerfile、`run.ps1`、`command.txt`、保留原始训练/测试脚本并新增 robust fine-tune 脚本 |
 
 ## 关键改动概览
 
@@ -44,13 +63,15 @@
 | `train.py` | 训练主入口 |
 | `dust3r/` | 主要模型、推理、loss、数据集与运行时工具 |
 | `scripts/` | 训练、测试与轨迹生成脚本 |
+| `checkpoints/` | 权重放置位置，见 `checkpoints/README.md` |
 | `data/` | 原始数据放置位置，见 `data/README.md` |
 | `trajectories/` | 训练/评测轨迹放置位置，见 `trajectories/README.md` |
-| `checkpoints/` | 权重放置位置，见 `checkpoints/README.md` |
+| `command.txt` | 基于 `uv` 的 Linux 快速启动命令清单 |
+| `run.ps1` | Windows / WSL 下的 Docker Demo 启动脚本 |
 
 ## 环境准备
 
-当前依赖配置以 **Python 3.12 + CUDA 12.4 + PyTorch 2.4.1** 为主。
+当前依赖配置以 **Python 3.12 + CUDA 12.4 + PyTorch 2.4.1** 为主，与 `Dockerfile` 和 `requirements.txt` 保持一致。
 
 ### 方式 1：本地安装（Linux / WSL）
 
@@ -62,6 +83,8 @@ cd better-mvdust3r
 
 `install.sh` 会创建 `mvdp` conda 环境，并安装 `requirements.txt` 中的依赖与 `pytorch3d`。
 
+如果你想快速手动搭环境，也可以逐行参考仓库里的 `command.txt`；其中默认直接使用内置的 `checkpoints/best.pth`。
+
 如需更快的运行时，可额外编译 RoPE CUDA kernel：
 
 ```bash
@@ -72,13 +95,19 @@ cd ../../..
 
 ### 方式 2：Docker
 
-仓库已经提供了基于 CUDA 12.4 的 `Dockerfile`：
-
 ```bash
 docker build -t mvdust3r:cu124 .
 ```
 
-Windows PowerShell 可直接使用仓库内的 `run.ps1` 启动容器 Demo。
+该镜像的入口是 `python demo.py`，默认 `CMD` 为 `--help`。
+
+### 方式 3：Windows / WSL PowerShell
+
+```powershell
+pwsh -File .\run.ps1
+```
+
+`run.ps1` 会以 Docker 方式启动 Demo，并默认使用 `checkpoints/best.pth`。
 
 ## 权重与数据
 
@@ -180,6 +209,13 @@ python inference_global_optimization.py \
 | `--go_rel_tol` | `5e-4` |
 | `--go_patience` | `3` |
 
+不同入口支持的运行时参数并不完全相同：
+
+| 入口 | 已接入参数 |
+| --- | --- |
+| `demo.py` | `--runtime_profile`、`--amp`、`--preprocess_profile`、`--quality_adaptive`、`--focal_conf_percentile` |
+| `inference_global_optimization.py` | 上述参数，以及 `--pair_batch_size`、`--oom_retry`、`--scene_graph_policy`、`--conf_percentile`、`--go_*` |
+
 ## 训练与评测
 
 ### 原始脚本
@@ -209,7 +245,7 @@ robust fine-tune 的默认策略包括：
 - `geom_noise_prob=0.15`
 - `geom_loss_weight=0.3`
 
-附加超参数说明见 `scripts/README.md`。
+附加超参数说明见 `scripts/README.md`，其中已经解释了 `n_all`、`num_views`、`num_render_views`、`random_nv_nr`、`n_ref`、`pts_head_config` 和 `m_ref_flag` 等字段。
 
 ## 当前状态与边界
 
